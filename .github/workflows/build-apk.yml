@@ -1,0 +1,1233 @@
+name: Build SurroundSync APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Create Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/surroundsync/app/
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SurroundSync"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.surroundsync.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.surroundsync.app"
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies {}
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:allowBackup="true"
+                  android:label="SurroundSync"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode|screenLayout|smallestScreenSize|density|locale|layoutDirection">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".AudioCaptureService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/surroundsync/app/Core.kt
+          package com.surroundsync.app
+
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioPlaybackCaptureConfiguration
+          import android.media.AudioRecord
+          import android.media.AudioTrack
+          import android.media.projection.MediaProjection
+          import android.net.wifi.WifiManager
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.Process
+          import android.util.Log
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.net.NetworkInterface
+          import java.net.SocketAddress
+          import java.net.SocketTimeoutException
+          import java.nio.ByteBuffer
+          import java.util.Collections
+          import java.util.concurrent.Executors
+          import java.util.concurrent.LinkedBlockingQueue
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.PI
+          import kotlin.math.exp
+          import kotlin.math.sin
+
+          private const val TAG = "SurroundSync"
+
+          enum class Role(val label: String, val tag: String) {
+              FL("Front Left", "FL"),
+              FR("Front Right", "FR"),
+              C("Center (vocals)", "C"),
+              SL("Side Left", "SL"),
+              SR("Side Right", "SR"),
+              RL("Rear Left", "RL"),
+              RR("Rear Right", "RR"),
+              SUB("Bass (sub)", "SUB"),
+              TOP("Overhead (height)", "TOP")
+          }
+
+          fun layoutFor(n: Int): List<Role> = when (n) {
+              2 -> listOf(Role.FL, Role.FR)
+              3 -> listOf(Role.FL, Role.C, Role.FR)
+              4 -> listOf(Role.FL, Role.FR, Role.RL, Role.RR)
+              5 -> listOf(Role.FL, Role.C, Role.FR, Role.RL, Role.RR)
+              6 -> listOf(Role.FL, Role.C, Role.FR, Role.RL, Role.RR, Role.SUB)
+              7 -> listOf(Role.FL, Role.C, Role.FR, Role.RL, Role.RR, Role.SUB, Role.TOP)
+              else -> listOf(Role.FL, Role.C, Role.FR, Role.SL, Role.SR, Role.RL, Role.RR, Role.SUB)
+          }
+
+          fun layoutNote(n: Int): String = when (n) {
+              2 -> "stereo"
+              3 -> "3.0, vocals in the center"
+              4 -> "quad surround"
+              5 -> "5.0 surround"
+              6 -> "5.1 surround"
+              7 -> "5.1 plus an overhead phone"
+              else -> "7.1 surround"
+          }
+
+          object Net {
+              const val DISCOVERY_PORT = 50004
+              const val CONTROL_PORT = 50005
+              const val CLIENT_PORT = 50006
+              const val SAMPLE_RATE = 44100
+              const val CHUNK_BYTES = 1280
+              const val HEADER_BYTES = 17
+              const val LATENCY_MS = 250L
+          }
+
+          object Shared {
+              @Volatile
+              var engine: SurroundEngine? = null
+          }
+
+          class SurroundEngine(private val context: Context) {
+              class SlotInfo(val role: Role, val device: String?)
+              private class Pkt(val dueNs: Long, val pcm: ShortArray)
+
+              private val pool = Executors.newCachedThreadPool()
+              private val ui = Handler(Looper.getMainLooper())
+              private val lock = Any()
+
+              @Volatile
+              private var session = 0
+
+              var onRoomFound: ((String, String) -> Unit)? = null
+              var onRole: ((Role) -> Unit)? = null
+              var onStatus: ((String) -> Unit)? = null
+
+              // host state
+              @Volatile
+              var capturing = false
+              private var layout: List<Role> = emptyList()
+              private val slots = arrayOfNulls<String>(8)
+              private val names = HashMap<String, String>()
+              private val lastSeen = HashMap<String, Long>()
+
+              // client state
+              @Volatile private var myRole: Role? = null
+              @Volatile private var roomFull = false
+              @Volatile private var offsetNs = 0L
+              @Volatile private var haveOffset = false
+              @Volatile private var lastHeardMs = 0L
+              @Volatile private var playoutEpoch = 0
+              private var sampleIdx = 0
+              private val rtts = LongArray(10)
+              private val offs = LongArray(10)
+              private val queue = LinkedBlockingQueue<Pkt>()
+              private val aSub = (1.0 - exp(-2.0 * PI * 250.0 / Net.SAMPLE_RATE)).toFloat()
+              private val aTop = (1.0 - exp(-2.0 * PI * 3000.0 / Net.SAMPLE_RATE)).toFloat()
+
+              private fun newSession(): Int = synchronized(lock) {
+                  session += 1
+                  session
+              }
+
+              private fun spawn(name: String, block: () -> Unit) {
+                  pool.execute {
+                      try {
+                          block()
+                      } catch (e: Throwable) {
+                          Log.w(TAG, "$name stopped: ${e.message}")
+                      }
+                  }
+              }
+
+              private fun openSocket(port: Int, timeoutMs: Int): DatagramSocket {
+                  val s = DatagramSocket(null as SocketAddress?)
+                  s.reuseAddress = true
+                  s.bind(InetSocketAddress(port))
+                  s.soTimeout = timeoutMs
+                  return s
+              }
+
+              private fun broadcastTargets(): List<InetAddress> {
+                  val out = ArrayList<InetAddress>()
+                  try {
+                      for (ni in Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                          if (!ni.isUp || ni.isLoopback) continue
+                          for (ia in ni.interfaceAddresses) {
+                              val b = ia.broadcast
+                              if (b != null) out.add(b)
+                          }
+                      }
+                  } catch (e: Exception) {
+                      Log.w(TAG, "broadcast scan failed: ${e.message}")
+                  }
+                  try {
+                      out.add(InetAddress.getByName("255.255.255.255"))
+                  } catch (e: Exception) {
+                  }
+                  return out
+              }
+
+              fun stopAll() {
+                  synchronized(lock) { session += 1 }
+                  capturing = false
+                  clearHost()
+                  myRole = null
+                  roomFull = false
+              }
+
+              private fun clearHost() {
+                  synchronized(lock) {
+                      slots.fill(null)
+                      names.clear()
+                      lastSeen.clear()
+                  }
+              }
+
+              // ---------------- HOST ----------------
+
+              fun startHost(roomName: String, count: Int) {
+                  val my = newSession()
+                  clearHost()
+                  synchronized(lock) { layout = layoutFor(count) }
+                  spawn("beacon") { beaconLoop(my, roomName, count) }
+                  spawn("control") { controlLoop(my) }
+              }
+
+              fun slotInfo(): List<SlotInfo> = synchronized(lock) {
+                  layout.mapIndexed { i, r ->
+                      val ip = slots[i]
+                      SlotInfo(r, if (ip != null) (names[ip] ?: "Phone") else null)
+                  }
+              }
+
+              fun swapSlots(a: Int, b: Int) {
+                  synchronized(lock) {
+                      if (a in layout.indices && b in layout.indices) {
+                          val t = slots[a]
+                          slots[a] = slots[b]
+                          slots[b] = t
+                      }
+                  }
+              }
+
+              fun sendBeep(slot: Int) {
+                  val ip = synchronized(lock) { slots.getOrNull(slot) } ?: return
+                  spawn("beep-send") {
+                      val s = DatagramSocket()
+                      try {
+                          val m = "C|BEEP".toByteArray()
+                          s.send(DatagramPacket(m, m.size, InetAddress.getByName(ip), Net.CLIENT_PORT))
+                      } finally {
+                          s.close()
+                      }
+                  }
+              }
+
+              private fun beaconLoop(my: Int, roomName: String, count: Int) {
+                  val socket = DatagramSocket()
+                  try {
+                      socket.broadcast = true
+                      val msg = "SSYNC1|$roomName|$count".toByteArray()
+                      while (session == my) {
+                          for (addr in broadcastTargets()) {
+                              try {
+                                  socket.send(DatagramPacket(msg, msg.size, addr, Net.DISCOVERY_PORT))
+                              } catch (e: Exception) {
+                              }
+                          }
+                          Thread.sleep(1000)
+                      }
+                  } finally {
+                      socket.close()
+                  }
+              }
+
+              private fun controlLoop(my: Int) {
+                  val socket = openSocket(Net.CONTROL_PORT, 500)
+                  try {
+                      val buf = ByteArray(512)
+                      while (session == my) {
+                          expireClients()
+                          val p = DatagramPacket(buf, buf.size)
+                          try {
+                              socket.receive(p)
+                          } catch (e: SocketTimeoutException) {
+                              continue
+                          }
+                          val parts = String(p.data, 0, p.length).split("|")
+                          if (parts.size < 2 || parts[0] != "C") continue
+                          val ip = p.address.hostAddress ?: continue
+                          when (parts[1]) {
+                              "JOIN" -> handleJoin(socket, p.address, ip, parts.getOrElse(2) { "Phone" })
+                              "PING" -> if (parts.size >= 3) {
+                                  val reply = "C|PONG|${parts[2]}|${System.nanoTime()}".toByteArray()
+                                  try {
+                                      socket.send(DatagramPacket(reply, reply.size, p.address, Net.CLIENT_PORT))
+                                  } catch (e: Exception) {
+                                  }
+                              }
+                          }
+                      }
+                  } finally {
+                      socket.close()
+                  }
+              }
+
+              private fun handleJoin(socket: DatagramSocket, addr: InetAddress, ip: String, name: String) {
+                  val role: Role? = synchronized(lock) {
+                      if (slots.indexOf(ip) < 0) {
+                          val free = (0 until layout.size).firstOrNull { slots[it] == null }
+                          if (free != null) slots[free] = ip
+                      }
+                      val idx = slots.indexOf(ip)
+                      if (idx >= 0 && idx < layout.size) {
+                          lastSeen[ip] = System.currentTimeMillis()
+                          names[ip] = name
+                          layout[idx]
+                      } else {
+                          null
+                      }
+                  }
+                  val reply = (if (role != null) "C|ROLE|${role.name}" else "C|FULL").toByteArray()
+                  try {
+                      socket.send(DatagramPacket(reply, reply.size, addr, Net.CLIENT_PORT))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun expireClients() {
+                  val now = System.currentTimeMillis()
+                  synchronized(lock) {
+                      val dead = lastSeen.filter { now - it.value > 6000L }.keys.toList()
+                      for (ip in dead) {
+                          lastSeen.remove(ip)
+                          names.remove(ip)
+                          val i = slots.indexOf(ip)
+                          if (i >= 0) slots[i] = null
+                      }
+                  }
+              }
+
+              @SuppressLint("MissingPermission")
+              fun startCapture(projection: MediaProjection) {
+                  val my = synchronized(lock) { session }
+                  projection.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          capturing = false
+                      }
+                  }, ui)
+                  capturing = true
+                  spawn("capture") { captureLoop(my, projection) }
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun captureLoop(my: Int, projection: MediaProjection) {
+                  Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                  var recorder: AudioRecord? = null
+                  val socket = DatagramSocket()
+                  try {
+                      val format = AudioFormat.Builder()
+                          .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                          .setSampleRate(Net.SAMPLE_RATE)
+                          .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                          .build()
+                      val cfg = AudioPlaybackCaptureConfiguration.Builder(projection)
+                          .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                          .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                          .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                          .build()
+                      val rec = AudioRecord.Builder()
+                          .setAudioFormat(format)
+                          .setBufferSizeInBytes(Net.CHUNK_BYTES * 8)
+                          .setAudioPlaybackCaptureConfig(cfg)
+                          .build()
+                      recorder = rec
+                      rec.startRecording()
+                      val streamId = (System.nanoTime() and 0x7FFFFFFFL).toInt()
+                      val pcm = ByteArray(Net.CHUNK_BYTES)
+                      val packet = ByteArray(Net.HEADER_BYTES + Net.CHUNK_BYTES)
+                      val addrs = HashMap<String, InetAddress>()
+                      var seq = 0
+                      while (session == my && capturing) {
+                          val n = rec.read(pcm, 0, pcm.size)
+                          if (n < 0) break
+                          if (n == 0) continue
+                          val nowNs = System.nanoTime()
+                          val bb = ByteBuffer.wrap(packet)
+                          bb.put('A'.code.toByte())
+                          bb.putInt(streamId)
+                          bb.putInt(seq)
+                          bb.putLong(nowNs)
+                          seq += 1
+                          System.arraycopy(pcm, 0, packet, Net.HEADER_BYTES, n)
+                          val targets = synchronized(lock) { lastSeen.keys.toList() }
+                          for (ip in targets) {
+                              try {
+                                  val a = addrs.getOrPut(ip) { InetAddress.getByName(ip) }
+                                  socket.send(DatagramPacket(packet, Net.HEADER_BYTES + n, a, Net.CLIENT_PORT))
+                              } catch (e: Exception) {
+                              }
+                          }
+                      }
+                  } catch (e: Exception) {
+                      Log.w(TAG, "capture failed: ${e.message}")
+                      ui.post { onStatus?.invoke("Capture failed: ${e.message}") }
+                  } finally {
+                      try {
+                          recorder?.stop()
+                      } catch (e: Exception) {
+                      }
+                      recorder?.release()
+                      socket.close()
+                      capturing = false
+                      try {
+                          projection.stop()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              // ---------------- CLIENT ----------------
+
+              fun startScanner() {
+                  val my = newSession()
+                  spawn("scanner") {
+                      val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      val mlock = wm.createMulticastLock("surroundsync")
+                      mlock.setReferenceCounted(false)
+                      mlock.acquire()
+                      val socket = openSocket(Net.DISCOVERY_PORT, 1000)
+                      try {
+                          val buf = ByteArray(256)
+                          while (session == my) {
+                              val p = DatagramPacket(buf, buf.size)
+                              try {
+                                  socket.receive(p)
+                              } catch (e: SocketTimeoutException) {
+                                  continue
+                              }
+                              val parts = String(p.data, 0, p.length).split("|")
+                              if (parts.size >= 3 && parts[0] == "SSYNC1") {
+                                  val name = parts[1]
+                                  val ip = p.address.hostAddress ?: continue
+                                  ui.post { onRoomFound?.invoke(name, ip) }
+                              }
+                          }
+                      } finally {
+                          socket.close()
+                          if (mlock.isHeld) mlock.release()
+                      }
+                  }
+              }
+
+              fun joinHost(hostIp: String, deviceName: String) {
+                  val my = newSession()
+                  myRole = null
+                  roomFull = false
+                  haveOffset = false
+                  sampleIdx = 0
+                  queue.clear()
+                  playoutEpoch += 1
+                  lastHeardMs = System.currentTimeMillis()
+                  spawn("heartbeat") { heartbeatLoop(my, hostIp, deviceName) }
+                  spawn("receiver") { receiveLoop(my) }
+                  spawn("playout") { playoutLoop(my) }
+              }
+
+              private fun heartbeatLoop(my: Int, hostIp: String, deviceName: String) {
+                  val socket = DatagramSocket()
+                  try {
+                      val host = InetAddress.getByName(hostIp)
+                      while (session == my) {
+                          try {
+                              val join = "C|JOIN|$deviceName".toByteArray()
+                              val ping = "C|PING|${System.nanoTime()}".toByteArray()
+                              socket.send(DatagramPacket(join, join.size, host, Net.CONTROL_PORT))
+                              socket.send(DatagramPacket(ping, ping.size, host, Net.CONTROL_PORT))
+                          } catch (e: Exception) {
+                              Log.w(TAG, "heartbeat send failed: ${e.message}")
+                          }
+                          val msg = when {
+                              roomFull -> "Room is full"
+                              System.currentTimeMillis() - lastHeardMs > 8000L -> "Waiting for host..."
+                              else -> "Connected"
+                          }
+                          ui.post { onStatus?.invoke(msg) }
+                          Thread.sleep(if (haveOffset) 1000L else 250L)
+                      }
+                  } finally {
+                      socket.close()
+                  }
+              }
+
+              private fun receiveLoop(my: Int) {
+                  val socket = openSocket(Net.CLIENT_PORT, 500)
+                  try {
+                      val buf = ByteArray(2048)
+                      var haveStream = false
+                      var curStream = 0
+                      var lastSeq = -1
+                      var lastRole: Role? = null
+                      var lpSub = 0f
+                      var lpTop = 0f
+                      while (session == my) {
+                          val p = DatagramPacket(buf, buf.size)
+                          try {
+                              socket.receive(p)
+                          } catch (e: SocketTimeoutException) {
+                              continue
+                          }
+                          if (p.length < 2) continue
+                          lastHeardMs = System.currentTimeMillis()
+                          val kind = buf[0].toInt()
+                          if (kind == 'C'.code) {
+                              handleClientControl(String(buf, 0, p.length))
+                              continue
+                          }
+                          if (kind != 'A'.code || p.length <= Net.HEADER_BYTES + 4) continue
+                          if (!haveOffset) continue
+                          val bb = ByteBuffer.wrap(buf, 1, p.length - 1)
+                          val sid = bb.getInt()
+                          val seq = bb.getInt()
+                          val hostNs = bb.getLong()
+                          if (!haveStream || sid != curStream) {
+                              haveStream = true
+                              curStream = sid
+                              lastSeq = -1
+                              queue.clear()
+                              playoutEpoch += 1
+                          }
+                          if (seq <= lastSeq) continue
+                          lastSeq = seq
+                          val role = myRole ?: continue
+                          if (role != lastRole) {
+                              lastRole = role
+                              lpSub = 0f
+                              lpTop = 0f
+                          }
+                          val frames = (p.length - Net.HEADER_BYTES) / 4
+                          val out = ShortArray(frames)
+                          var idx = Net.HEADER_BYTES
+                          for (i in 0 until frames) {
+                              val l = ((buf[idx + 1].toInt() shl 8) or (buf[idx].toInt() and 0xFF)).toShort().toFloat()
+                              val r = ((buf[idx + 3].toInt() shl 8) or (buf[idx + 2].toInt() and 0xFF)).toShort().toFloat()
+                              idx += 4
+                              val mid = (l + r) * 0.5f
+                              val side = (l - r) * 0.5f
+                              val v: Float = when (role) {
+                                  Role.FL -> l
+                                  Role.FR -> r
+                                  Role.C -> mid * 1.2f
+                                  Role.SL -> 0.5f * l + 0.7f * side
+                                  Role.SR -> 0.5f * r - 0.7f * side
+                                  Role.RL -> 0.6f * l + 0.8f * side
+                                  Role.RR -> 0.6f * r - 0.8f * side
+                                  Role.SUB -> {
+                                      lpSub += aSub * (mid - lpSub)
+                                      lpSub * 2.5f
+                                  }
+                                  Role.TOP -> {
+                                      val s = side * 1.4f + mid * 0.3f
+                                      lpTop += aTop * (s - lpTop)
+                                      s - lpTop
+                                  }
+                              }
+                              out[i] = v.coerceIn(-32768f, 32767f).toInt().toShort()
+                          }
+                          if (queue.size > 400) queue.clear()
+                          queue.offer(Pkt(hostNs + Net.LATENCY_MS * 1_000_000L - offsetNs, out))
+                      }
+                  } finally {
+                      socket.close()
+                  }
+              }
+
+              private fun handleClientControl(msg: String) {
+                  val parts = msg.split("|")
+                  if (parts.size < 2) return
+                  when (parts[1]) {
+                      "ROLE" -> {
+                          val r: Role? = try {
+                              Role.valueOf(parts.getOrElse(2) { "" })
+                          } catch (e: IllegalArgumentException) {
+                              null
+                          }
+                          roomFull = false
+                          if (r != null && r != myRole) {
+                              myRole = r
+                              ui.post { onRole?.invoke(r) }
+                          }
+                      }
+                      "FULL" -> {
+                          roomFull = true
+                          myRole = null
+                      }
+                      "BEEP" -> playBeep()
+                      "PONG" -> if (parts.size >= 4) {
+                          val t0 = parts[2].toLongOrNull()
+                          val th = parts[3].toLongOrNull()
+                          if (t0 != null && th != null) addTimeSample(t0, th)
+                      }
+                  }
+              }
+
+              private fun addTimeSample(t0: Long, th: Long) {
+                  val t1 = System.nanoTime()
+                  val rtt = t1 - t0
+                  if (rtt < 0L || rtt > 500_000_000L) return
+                  val off = th + rtt / 2 - t1
+                  rtts[sampleIdx % 10] = rtt
+                  offs[sampleIdx % 10] = off
+                  sampleIdx += 1
+                  val n = if (sampleIdx < 10) sampleIdx else 10
+                  var best = 0
+                  for (i in 1 until n) {
+                      if (rtts[i] < rtts[best]) best = i
+                  }
+                  offsetNs = offs[best]
+                  haveOffset = true
+              }
+
+              private fun playBeep() {
+                  spawn("beep") {
+                      val n = Net.SAMPLE_RATE / 2
+                      val tone = ShortArray(n) { i ->
+                          val fade = if (i > n - 2000) (n - i) / 2000.0 else 1.0
+                          (sin(2.0 * PI * 880.0 * i / Net.SAMPLE_RATE) * 12000.0 * fade).toInt().toShort()
+                      }
+                      val track = AudioTrack.Builder()
+                          .setAudioAttributes(
+                              AudioAttributes.Builder()
+                                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                  .build()
+                          )
+                          .setAudioFormat(
+                              AudioFormat.Builder()
+                                  .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                  .setSampleRate(Net.SAMPLE_RATE)
+                                  .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                  .build()
+                          )
+                          .setBufferSizeInBytes(n * 2)
+                          .setTransferMode(AudioTrack.MODE_STATIC)
+                          .build()
+                      track.write(tone, 0, n)
+                      track.play()
+                      Thread.sleep(650)
+                      track.release()
+                  }
+              }
+
+              private fun playoutLoop(my: Int) {
+                  Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                  val minBuf = AudioTrack.getMinBufferSize(
+                      Net.SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  val track = AudioTrack.Builder()
+                      .setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                              .build()
+                      )
+                      .setAudioFormat(
+                          AudioFormat.Builder()
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setSampleRate(Net.SAMPLE_RATE)
+                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                              .build()
+                      )
+                      .setBufferSizeInBytes(maxOf(minBuf * 2, 8192))
+                      .setTransferMode(AudioTrack.MODE_STREAM)
+                      .build()
+                  track.play()
+                  try {
+                      var started = false
+                      var epochSeen = playoutEpoch
+                      var startNs = 0L
+                      var written = 0L
+                      while (session == my) {
+                          if (epochSeen != playoutEpoch) {
+                              epochSeen = playoutEpoch
+                              started = false
+                          }
+                          val pkt = queue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                          if (!started) {
+                              val wait = pkt.dueNs - System.nanoTime()
+                              if (wait < -50_000_000L) continue
+                              if (wait > 0L) Thread.sleep(wait / 1_000_000L, (wait % 1_000_000L).toInt())
+                              started = true
+                              startNs = pkt.dueNs
+                              written = 0L
+                          }
+                          val expectedNs = startNs + written * 1_000_000_000L / Net.SAMPLE_RATE
+                          val driftMs = (pkt.dueNs - expectedNs) / 1_000_000L
+                          if (driftMs > 20L) {
+                              val silence = ShortArray((driftMs * Net.SAMPLE_RATE / 1000L).toInt())
+                              track.write(silence, 0, silence.size)
+                              written += silence.size
+                          } else if (driftMs < -20L) {
+                              continue
+                          }
+                          track.write(pkt.pcm, 0, pkt.pcm.size)
+                          written += pkt.pcm.size
+                      }
+                  } finally {
+                      try {
+                          track.stop()
+                      } catch (e: Exception) {
+                      }
+                      track.release()
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/surroundsync/app/AudioCaptureService.kt
+          package com.surroundsync.app
+
+          import android.app.Activity
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.IBinder
+
+          class AudioCaptureService : Service() {
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              @Suppress("DEPRECATION")
+              private fun readProjectionData(intent: Intent?): Intent? =
+                  if (Build.VERSION.SDK_INT >= 33) intent?.getParcelableExtra("DATA", Intent::class.java)
+                  else intent?.getParcelableExtra("DATA")
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val channelId = "surround_channel"
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(channelId, "SurroundSync", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val notif = Notification.Builder(this, channelId)
+                      .setContentTitle("SurroundSync is streaming")
+                      .setContentText("Sending audio to the connected phones")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .build()
+                  startForeground(101, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+
+                  val code = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
+                  val data = readProjectionData(intent)
+                  if (code == Activity.RESULT_OK && data != null) {
+                      val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      val projection = pm.getMediaProjection(code, data)
+                      if (projection != null) Shared.engine?.startCapture(projection)
+                  }
+                  return START_NOT_STICKY
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/surroundsync/app/MainActivity.kt
+          package com.surroundsync.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private lateinit var engine: SurroundEngine
+              private lateinit var root: FrameLayout
+              private val ui = Handler(Looper.getMainLooper())
+              private var refresher: Runnable? = null
+              private var rerender: (() -> Unit)? = null
+              private var selectedSlot = -1
+              private var phoneCount = 5
+              private var lastSig = ""
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  engine = SurroundEngine(applicationContext)
+                  Shared.engine = engine
+
+                  val need = ArrayList<String>()
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      need.add(Manifest.permission.RECORD_AUDIO)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 100)
+
+                  root = FrameLayout(this)
+                  root.setBackgroundColor(Color.parseColor("#070A12"))
+                  setContentView(root)
+                  showHome()
+              }
+
+              // ---------- small UI helpers ----------
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun bg(fill: String, stroke: String? = null, radius: Int = 16): GradientDrawable {
+                  val d = GradientDrawable()
+                  d.setColor(Color.parseColor(fill))
+                  d.cornerRadius = dp(radius).toFloat()
+                  if (stroke != null) d.setStroke(dp(2), Color.parseColor(stroke))
+                  return d
+              }
+
+              private fun label(value: String, size: Float, color: String = "#FFFFFF", bold: Boolean = false): TextView {
+                  val t = TextView(this)
+                  t.text = value
+                  t.textSize = size
+                  t.setTextColor(Color.parseColor(color))
+                  if (bold) t.setTypeface(null, Typeface.BOLD)
+                  return t
+              }
+
+              private fun button(title: String, filled: Boolean, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = title
+                  b.setAllCaps(false)
+                  b.textSize = 16f
+                  b.setTypeface(null, Typeface.BOLD)
+                  b.setTextColor(if (filled) Color.parseColor("#04121A") else Color.WHITE)
+                  b.background = if (filled) bg("#00E5FF", null, 18) else bg("#070A12", "#00E5FF", 18)
+                  val lp = LinearLayout.LayoutParams(-1, dp(56))
+                  lp.topMargin = dp(12)
+                  b.layoutParams = lp
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun spacer(): View {
+                  val v = View(this)
+                  v.layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
+                  return v
+              }
+
+              private fun stopRefresh() {
+                  val r = refresher
+                  if (r != null) ui.removeCallbacks(r)
+                  refresher = null
+                  rerender = null
+              }
+
+              private fun screen(block: LinearLayout.() -> Unit) {
+                  stopRefresh()
+                  root.removeAllViews()
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(24), dp(56), dp(24), dp(28))
+                  col.block()
+                  root.addView(col, FrameLayout.LayoutParams(-1, -1))
+              }
+
+              // ---------- screens ----------
+
+              private fun showHome() {
+                  engine.stopAll()
+                  engine.onRoomFound = null
+                  engine.onRole = null
+                  engine.onStatus = null
+                  stopService(Intent(this, AudioCaptureService::class.java))
+                  screen {
+                      addView(label("SURROUND SYNC", 12f, "#00E5FF", true))
+                      val h = label("Turn every phone into a speaker", 30f, bold = true)
+                      h.setPadding(0, dp(12), 0, dp(8))
+                      addView(h)
+                      addView(label("Connect 2 to 8 Android phones over Wi-Fi and play music in surround.", 15f, "#9AA7BD"))
+                      addView(spacer())
+                      addView(button("Create room (Host)", true) { showHostSetup() })
+                      addView(button("Join a room", false) { showScan() })
+                  }
+              }
+
+              private fun showHostSetup() {
+                  screen {
+                      val info = label("", 15f)
+                      info.setPadding(dp(16), dp(16), dp(16), dp(16))
+                      info.background = bg("#0E1526", "#1C2A45", 20)
+                      val chipViews = ArrayList<Button>()
+
+                      fun refreshChips() {
+                          for (i in chipViews.indices) {
+                              val selected = (i + 2) == phoneCount
+                              chipViews[i].background = if (selected) bg("#00E5FF", null, 14) else bg("#131B2E", "#24324F", 14)
+                              chipViews[i].setTextColor(if (selected) Color.parseColor("#04121A") else Color.WHITE)
+                          }
+                          info.text = "$phoneCount phones = ${layoutNote(phoneCount)}\n" +
+                              layoutFor(phoneCount).joinToString("  |  ") { it.tag }
+                      }
+
+                      addView(label("STEP 1 OF 2", 12f, "#00E5FF", true))
+                      val h = label("How many speaker phones?", 26f, bold = true)
+                      h.setPadding(0, dp(10), 0, dp(6))
+                      addView(h)
+                      addView(label("This phone plays the music. Your friends' phones are the speakers.", 15f, "#9AA7BD"))
+
+                      val row1 = LinearLayout(this@MainActivity)
+                      val row2 = LinearLayout(this@MainActivity)
+                      val lp1 = LinearLayout.LayoutParams(-1, dp(56))
+                      lp1.topMargin = dp(20)
+                      val lp2 = LinearLayout.LayoutParams(-1, dp(56))
+                      lp2.topMargin = dp(10)
+                      addView(row1, lp1)
+                      addView(row2, lp2)
+                      for (n in 2..8) {
+                          val b = Button(this@MainActivity)
+                          b.text = n.toString()
+                          b.textSize = 20f
+                          b.setTypeface(null, Typeface.BOLD)
+                          b.setOnClickListener {
+                              phoneCount = n
+                              refreshChips()
+                          }
+                          val clp = LinearLayout.LayoutParams(0, -1, 1f)
+                          clp.setMargins(dp(4), 0, dp(4), 0)
+                          if (n <= 5) row1.addView(b, clp) else row2.addView(b, clp)
+                          chipViews.add(b)
+                      }
+                      val fill = View(this@MainActivity)
+                      row2.addView(fill, LinearLayout.LayoutParams(0, -1, 1f))
+
+                      val ilp = LinearLayout.LayoutParams(-1, -2)
+                      ilp.topMargin = dp(24)
+                      addView(info, ilp)
+                      refreshChips()
+                      addView(spacer())
+                      addView(button("Create room", true) {
+                          engine.startHost(Build.MODEL, phoneCount)
+                          showHostRoom()
+                      })
+                      addView(button("Back", false) { showHome() })
+                  }
+              }
+
+              private fun requestCapture() {
+                  val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  startActivityForResult(pm.createScreenCaptureIntent(), 1001)
+              }
+
+              private fun showHostRoom() {
+                  selectedSlot = -1
+                  lastSig = ""
+                  screen {
+                      val countTv = label("", 26f, bold = true)
+                      countTv.setPadding(0, dp(10), 0, dp(4))
+                      val hint = label("", 13f, "#9AA7BD")
+                      hint.setPadding(0, 0, 0, dp(14))
+                      val list = LinearLayout(this@MainActivity)
+                      list.orientation = LinearLayout.VERTICAL
+                      val scroll = ScrollView(this@MainActivity)
+                      scroll.addView(list)
+
+                      addView(label("YOUR ROOM", 12f, "#00E5FF", true))
+                      addView(countTv)
+                      addView(hint)
+                      addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+                      addView(button("Start streaming", true) { requestCapture() })
+                      addView(button("Stop and exit", false) { showHome() })
+
+                      engine.onStatus = { msg -> Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show() }
+                      val draw = { renderSlots(list, countTv, hint) }
+                      rerender = draw
+                      val tick = object : Runnable {
+                          override fun run() {
+                              draw()
+                              ui.postDelayed(this, 700)
+                          }
+                      }
+                      refresher = tick
+                      ui.post(tick)
+                  }
+              }
+
+              private fun renderSlots(list: LinearLayout, countTv: TextView, hint: TextView) {
+                  val slots = engine.slotInfo()
+                  val sig = slots.joinToString(",") { it.role.tag + ":" + it.device } + "|" + selectedSlot + "|" + engine.capturing
+                  if (sig == lastSig) return
+                  lastSig = sig
+
+                  val connected = slots.count { it.device != null }
+                  countTv.text = "$connected of ${slots.size} phones connected"
+                  hint.text = if (engine.capturing) {
+                      "Streaming now. Lower this phone's volume or use earphones to avoid echo."
+                  } else {
+                      "Tap one phone, then another, to swap their roles. Then press Start."
+                  }
+
+                  list.removeAllViews()
+                  for (i in slots.indices) {
+                      val s = slots[i]
+                      val row = LinearLayout(this)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      row.gravity = Gravity.CENTER_VERTICAL
+                      row.setPadding(dp(14), 0, dp(10), 0)
+                      row.background = bg("#131B2E", if (i == selectedSlot) "#00E5FF" else "#24324F")
+                      row.setOnClickListener { onSlotTap(i) }
+
+                      val dot = View(this)
+                      val dd = GradientDrawable()
+                      dd.shape = GradientDrawable.OVAL
+                      dd.setColor(Color.parseColor(if (s.device != null) "#00C853" else "#5A6A85"))
+                      dot.background = dd
+                      val dlp = LinearLayout.LayoutParams(dp(10), dp(10))
+                      dlp.rightMargin = dp(12)
+                      row.addView(dot, dlp)
+
+                      val texts = LinearLayout(this)
+                      texts.orientation = LinearLayout.VERTICAL
+                      texts.addView(label(s.role.label, 15f, bold = true))
+                      texts.addView(label(s.device ?: "Waiting for a phone...", 12f, "#9AA7BD"))
+                      row.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+
+                      if (s.device != null) {
+                          val b = Button(this)
+                          b.text = "Test beep"
+                          b.setAllCaps(false)
+                          b.textSize = 13f
+                          b.setTextColor(Color.parseColor("#00E5FF"))
+                          b.background = bg("#070A12", "#00E5FF", 12)
+                          b.setOnClickListener { engine.sendBeep(i) }
+                          row.addView(b, LinearLayout.LayoutParams(-2, dp(44)))
+                      }
+
+                      val rlp = LinearLayout.LayoutParams(-1, dp(64))
+                      rlp.bottomMargin = dp(10)
+                      list.addView(row, rlp)
+                  }
+              }
+
+              private fun onSlotTap(i: Int) {
+                  if (selectedSlot == -1) {
+                      selectedSlot = i
+                  } else {
+                      if (selectedSlot != i) engine.swapSlots(selectedSlot, i)
+                      selectedSlot = -1
+                  }
+                  lastSig = ""
+                  rerender?.invoke()
+              }
+
+              private fun showScan() {
+                  screen {
+                      val status = label("Looking for a room...", 18f, bold = true)
+                      status.setPadding(0, dp(10), 0, dp(6))
+                      val found = LinearLayout(this@MainActivity)
+                      found.orientation = LinearLayout.VERTICAL
+                      addView(label("JOIN A ROOM", 12f, "#00E5FF", true))
+                      addView(status)
+                      addView(label("Connect this phone to the host's hotspot (or the same Wi-Fi).", 14f, "#9AA7BD"))
+                      val flp = LinearLayout.LayoutParams(-1, 0, 1f)
+                      flp.topMargin = dp(20)
+                      addView(found, flp)
+                      addView(button("Back", false) { showHome() })
+
+                      val seen = HashSet<String>()
+                      engine.onRoomFound = { name, ip ->
+                          if (seen.add(ip)) {
+                              status.text = "Room found"
+                              found.addView(button("Join $name", true) { showSpeaker(ip) })
+                          }
+                      }
+                      engine.startScanner()
+                  }
+              }
+
+              private fun showSpeaker(ip: String) {
+                  screen {
+                      val statusTv = label("CONNECTING...", 12f, "#4ADE80", true)
+                      val roleTv = label("WAITING...", 38f, "#00E5FF", true)
+                      val noteTv = label("The host will give this phone a role.", 14f, "#9AA7BD")
+                      noteTv.setPadding(0, dp(6), 0, 0)
+                      val cap = label("YOUR SPEAKER ROLE", 12f, "#9AA7BD")
+                      cap.setPadding(0, dp(40), 0, dp(8))
+
+                      addView(statusTv)
+                      addView(cap)
+                      addView(roleTv)
+                      addView(noteTv)
+                      addView(spacer())
+                      addView(label("Use this phone's volume buttons to adjust the sound.", 13f, "#9AA7BD"))
+                      addView(button("Disconnect", false) { showHome() })
+
+                      engine.onStatus = { s -> statusTv.text = s.uppercase() }
+                      engine.onRole = { r ->
+                          roleTv.text = r.label.uppercase()
+                          noteTv.text = "Keep this phone at its spot in the room, facing the listeners."
+                      }
+                      engine.joinHost(ip, Build.MODEL)
+                  }
+              }
+
+              @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 1001 && resultCode == RESULT_OK && data != null) {
+                      val svc = Intent(this, AudioCaptureService::class.java)
+                      svc.putExtra("RESULT_CODE", resultCode)
+                      svc.putExtra("DATA", data)
+                      startForegroundService(svc)
+                  }
+              }
+
+              override fun onDestroy() {
+                  stopRefresh()
+                  if (isFinishing) {
+                      engine.stopAll()
+                      stopService(Intent(this, AudioCaptureService::class.java))
+                  }
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Build APK with Gradle
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload Ready-to-Install APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SurroundSync-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
